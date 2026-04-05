@@ -16,7 +16,8 @@ using namespace OgreBites;
  *   - 路点标记：sphere.mesh
  *   - plugins.cfg 中需加载地形场景管理器插件（如 Plugin_OctreeSceneManager、地形相关插件，依 SDK 为准）
  *
- * 操作：鼠标左键点地形添加路点（顺序即路径）；熊沿折线循环行走；仅 1 个路点且到达后站立。
+ * 操作：WASD / 方向键 — 在地形上沿视角水平漫游（自动贴地）；鼠标右键拖动环顾；滚轮缩放；中键平移。
+ * 鼠标左键点地形添加路点（顺序即路径）；熊沿折线循环行走；仅 1 个路点且到达后站立。
  * Clear all waypoints 清除路点与标记；速度按钮循环切换行走速度。
  */
 
@@ -24,7 +25,9 @@ class MyBuffInputListener : public FrameListener, public OIS::MouseListener, pub
 {
 public:
     MyBuffInputListener(Ogre::SceneManager* pSM, RenderWindow* pWin, Ogre::Camera* cam)
-        : mZoomSpeed(1.0f), mMouseSensitivity(0.15f),
+        :         mZoomSpeed(1.0f), mMouseSensitivity(0.15f),
+        mRoamSpeed(120.0f), mEyeHeight(10.0f),
+        mKeyForward(false), mKeyBack(false), mKeyLeft(false), mKeyRight(false),
         mRightMouseDown(false), mMiddleMouseDown(false), mShiftDown(false),
         mMouseDeltaX(0), mMouseDeltaY(0), mYaw(0), mPitch(0),
         mAnimSpeed(1.0f),
@@ -34,7 +37,6 @@ public:
         mWaypointVisualCounter(0)
     {
         m_Continue = true;
-        translate = Ogre::Vector3::ZERO;
 
         if (pSM != NULL)
             m_pSM = pSM;
@@ -100,8 +102,8 @@ public:
 
         OgreBites::TextBox* textBox = m_TrayMgr->createTextBox(TL_TOPLEFT, "Help", "PathHelp", 260, 120);
         textBox->setText(
-            "Terrain path: L-click = add waypoint. Bear follows path in order, loops. "
-            "Clear = remove waypoints. Tray UI has priority.");
+            "Roam: WASD or arrows (view-relative, terrain height). R-drag look, wheel zoom. "
+            "Path: L-click waypoint; Clear / speed on tray. Tray UI has priority.");
 
         m_TrayMgr->createButton(TL_TOP, "ClearWaypoints", "Clear all waypoints", 220);
         mSpeedButton = m_TrayMgr->createButton(TL_TOP, "SpeedButton", "Walk speed: 80", 220);
@@ -145,6 +147,54 @@ public:
             return false;
         outY = hit.y;
         return true;
+    }
+
+    /** 取相机节点在水平面上的前向、右向（与右键环顾一致，仅 XZ；兼容 Ogre 1.7）。 */
+    void getCameraWalkAxes(Ogre::Vector3& outForward, Ogre::Vector3& outRight) const
+    {
+        Ogre::Quaternion q = mCameraNode->getOrientation();
+        // 相机本地 -Z 为视线方向；投影到 XZ 即为漫游前向
+        outForward = q * Ogre::Vector3::NEGATIVE_UNIT_Z;
+        outForward.y = 0;
+        if (outForward.squaredLength() > 1e-8f)
+            outForward.normalise();
+        else
+            outForward = Ogre::Vector3::NEGATIVE_UNIT_Z;
+
+        outRight = q * Ogre::Vector3::UNIT_X;
+        outRight.y = 0;
+        if (outRight.squaredLength() > 1e-8f)
+            outRight.normalise();
+        else
+            outRight = Ogre::Vector3::UNIT_X;
+    }
+
+    /** 键盘漫游：将相机节点 Y 对齐到地形 + 视点高度（贴地行走）。 */
+    void snapCameraToTerrain()
+    {
+        Ogre::Vector3 p = mCameraNode->getPosition();
+        Ogre::Real h = p.y;
+        if (sampleTerrainHeight(p.x, p.z, h))
+            mCameraNode->setPosition(p.x, h + mEyeHeight, p.z);
+    }
+
+    /** 非漫游时：仅当相机低于地表时上推，保留高空俯视与滚轮拉远（与原先防穿地一致）。 */
+    void ensureCameraAboveTerrain()
+    {
+        Ogre::Vector3 camPos = m_cam->getDerivedPosition();
+        Ogre::Ray cameraRay(Ogre::Vector3(camPos.x, 5000.0f, camPos.z), Ogre::Vector3::NEGATIVE_UNIT_Y);
+        mRaySceneQuery->setRay(cameraRay);
+        Ogre::RaySceneQueryResult& result = mRaySceneQuery->execute();
+        Ogre::RaySceneQueryResult::iterator itr = result.begin();
+        if (itr != result.end() && itr->worldFragment != NULL)
+        {
+            Ogre::Real terrainHeight = itr->worldFragment->singleIntersection.y;
+            if ((terrainHeight + mEyeHeight) > camPos.y)
+            {
+                Ogre::Vector3 lp = mCameraNode->getPosition();
+                mCameraNode->setPosition(lp.x, lp.y + (terrainHeight + mEyeHeight - camPos.y), lp.z);
+            }
+        }
     }
 
     /**
@@ -292,15 +342,16 @@ public:
 
     bool keyPressed(const OIS::KeyEvent& arg) override
     {
-        translate = Ogre::Vector3::ZERO;
-
         switch (arg.key)
         {
-        // 方向键：平移相机节点（世界空间），与熊的路径运动独立
-        case OIS::KC_UP:    translate += Ogre::Vector3(0, 0, -30); break;
-        case OIS::KC_DOWN:  translate += Ogre::Vector3(0, 0, 30); break;
-        case OIS::KC_LEFT:  translate += Ogre::Vector3(-30, 0, 0); break;
-        case OIS::KC_RIGHT: translate += Ogre::Vector3(30, 0, 0); break;
+        case OIS::KC_W:
+        case OIS::KC_UP:     mKeyForward = true; break;
+        case OIS::KC_S:
+        case OIS::KC_DOWN:   mKeyBack = true; break;
+        case OIS::KC_A:
+        case OIS::KC_LEFT:   mKeyLeft = true; break;
+        case OIS::KC_D:
+        case OIS::KC_RIGHT:  mKeyRight = true; break;
         case OIS::KC_ESCAPE: m_Continue = false; break;
         default: break;
         }
@@ -309,7 +360,18 @@ public:
 
     bool keyReleased(const OIS::KeyEvent& arg) override
     {
-        (void)arg;
+        switch (arg.key)
+        {
+        case OIS::KC_W:
+        case OIS::KC_UP:    mKeyForward = false; break;
+        case OIS::KC_S:
+        case OIS::KC_DOWN:  mKeyBack = false; break;
+        case OIS::KC_A:
+        case OIS::KC_LEFT:  mKeyLeft = false; break;
+        case OIS::KC_D:
+        case OIS::KC_RIGHT: mKeyRight = false; break;
+        default: break;
+        }
         return true;
     }
 
@@ -324,29 +386,29 @@ public:
         m_TrayMgr->refreshCursor();
         m_TrayMgr->frameRenderingQueued(evt);
 
-        // ---------- 相机防穿地：与教程 frameStarted 中 RaySceneQuery + worldFragment 一致 ----------
-        {
-            Ogre::Vector3 camPos = m_cam->getDerivedPosition();
-            Ogre::Ray cameraRay(Ogre::Vector3(camPos.x, 5000.0f, camPos.z), Ogre::Vector3::NEGATIVE_UNIT_Y);
-            mRaySceneQuery->setRay(cameraRay);
-            Ogre::RaySceneQueryResult& result = mRaySceneQuery->execute();
-            Ogre::RaySceneQueryResult::iterator itr = result.begin();
-            if (itr != result.end() && itr->worldFragment != NULL)
-            {
-                Ogre::Real terrainHeight = itr->worldFragment->singleIntersection.y;
-                if ((terrainHeight + 10.0f) > camPos.y)
-                {
-                    Ogre::Vector3 lp = mCameraNode->getPosition();
-                    mCameraNode->setPosition(lp.x, lp.y + (terrainHeight + 10.0f - camPos.y), lp.z);
-                }
-            }
-        }
-
         m_key->capture();
         m_mouse->capture();
 
-        // 键盘平移相机节点（可选）
-        mCameraNode->translate(translate * evt.timeSinceLastFrame, Ogre::Node::TS_WORLD);
+        // ---------- 地形漫游：WASD/方向键沿视角水平移动并贴地；其它时候仅防穿地 ----------
+        {
+            Ogre::Vector3 forward, right;
+            getCameraWalkAxes(forward, right);
+            Ogre::Vector3 move = Ogre::Vector3::ZERO;
+            if (mKeyForward) move += forward;
+            if (mKeyBack)    move -= forward;
+            if (mKeyRight)   move += right;
+            if (mKeyLeft)    move -= right;
+            if (move.squaredLength() > 1e-8f)
+            {
+                move.normalise();
+                mCameraNode->translate(move * mRoamSpeed * evt.timeSinceLastFrame, Ogre::Node::TS_WORLD);
+                snapCameraToTerrain();
+            }
+            else
+            {
+                ensureCameraAboveTerrain();
+            }
+        }
 
         updateBearPathAndAnimation(evt.timeSinceLastFrame);
 
@@ -397,7 +459,7 @@ public:
             newPos.y = h + 2.0f;
         mBearNode->setPosition(newPos);
 
-        // 水平面内朝向位移方向（模型前向为 -Z 时常用 atan2(-dx,-dz)）
+        // 水平面内朝向位移方向（模型前向为 Z 时常用 atan2(dx,dz)）
         if (flat.squaredLength() > 1e-6f)
         {
             mBearNode->setOrientation(Ogre::Quaternion(Ogre::Math::ATan2(flat.x, flat.z), Ogre::Vector3::UNIT_Y));
@@ -434,8 +496,11 @@ private:
     Ogre::Camera* m_cam;
     Ogre::SceneNode* mCameraNode;
     OIS::Mouse* m_mouse;
-    Ogre::Vector3 translate;
     bool m_Continue;
+
+    Ogre::Real mRoamSpeed;   ///< 漫游水平速度（世界单位/秒）
+    Ogre::Real mEyeHeight;   ///< 相对地形表面的视点高度，与防穿地一致
+    bool mKeyForward, mKeyBack, mKeyLeft, mKeyRight;
 
     Ogre::Entity* m_ent;
     Ogre::AnimationState* m_aniState;
